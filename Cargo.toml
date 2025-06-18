@@ -1,13 +1,12 @@
 [package]
-name = "gpu_fan_ctrl"
+name = "gpu-fan-controller"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-nvml-wrapper = "0.10"
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.10"
 chrono = "0.4"
-ctrlc = "3.4"
-nvml = "0.0.2"
+nvml-wrapper = "0.11"             # 安全、轻量的 NVML Rust 包:contentReference[oaicite:0]{index=0}
+ctrlc = "3"

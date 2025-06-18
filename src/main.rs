@@ -1,6 +1,7 @@
 use clap::Parser;
 use log::{info, warn, error};
-use nvml::NVML;
+use nvml_wrapper::Nvml;
+use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
 use std::fs::{OpenOptions, read_to_string};
 use std::io::Write;
 use std::path::Path;
@@ -8,10 +9,11 @@ use std::process::exit;
 use std::{thread, time};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use chrono;
+use ctrlc;
 
-/// 命令行参数
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about)]
 struct Args {
     /// 风扇 PWM 控制文件路径
     pwm_path: Option<String>,
@@ -25,11 +27,9 @@ struct Args {
     info: bool,
 }
 
-/// log初始化
 fn init_log() {
     env_logger::Builder::from_default_env()
         .format(|buf, record| {
-            use std::io::Write;
             writeln!(
                 buf,
                 "[{}] {:<8} {}",
@@ -41,128 +41,95 @@ fn init_log() {
         .init();
 }
 
-/// 从 pwm 路径推测 enable 路径
 fn find_enable_path(pwm_path: &str) -> String {
     format!("{}_enable", pwm_path)
 }
 
-/// 读取 enable 状态
 fn read_enable_mode(enable_path: &str) -> Option<u8> {
-    match read_to_string(enable_path) {
-        Ok(s) => s.trim().parse::<u8>().ok(),
-        Err(_) => None,
-    }
+    read_to_string(enable_path).ok()?.trim().parse().ok()
 }
 
-/// 设置 PWM 控制模式 (1=手动, 2=自动)
 fn set_pwm_mode(pwm_path: &str, mode: u8) -> bool {
-    let enable_path = find_enable_path(pwm_path);
-    if !Path::new(&enable_path).exists() {
-        error!("PWM使能文件不存在: {}", enable_path);
+    let enable = find_enable_path(pwm_path);
+    if !Path::new(&enable).exists() {
+        error!("PWM enable file not found: {}", enable);
         return false;
     }
-    if let Some(current) = read_enable_mode(&enable_path) {
+    if let Some(current) = read_enable_mode(&enable) {
         if current != mode {
-            if let Ok(mut f) = OpenOptions::new().write(true).open(&enable_path) {
-                if let Err(e) = f.write_all(mode.to_string().as_bytes()) {
-                    error!("无法设置PWM模式: {}", e);
+            if let Ok(mut f) = OpenOptions::new().write(true).open(&enable) {
+                if f.write_all(mode.to_string().as_bytes()).is_err() {
+                    error!("Failed to write PWM mode");
                     return false;
                 }
-                info!("PWM模式已设置为: {}", if mode == 1 {"手动"} else {"自动"});
-            } else {
-                error!("无法打开PWM使能文件: {}", enable_path);
-                return false;
+                info!("PWM mode set to {}", if mode==1 { "manual" } else { "auto" });
             }
         }
         true
     } else {
-        error!("读取PWM模式失败: {}", enable_path);
+        error!("Failed to read PWM mode from {}", enable);
         false
     }
 }
 
-/// 设置风扇转速 (0-255)
 fn set_fan_speed(pwm_path: &str, speed: u8) -> bool {
-    let val = speed.to_string();
-    match OpenOptions::new().write(true).open(pwm_path) {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(val.as_bytes()) {
-                error!("无法写入风扇控制文件 {}: {}", pwm_path, e);
-                return false;
-            }
+    if let Ok(mut f) = OpenOptions::new().write(true).open(pwm_path) {
+        if f.write_all(speed.to_string().as_bytes()).is_ok() {
             true
-        }
-        Err(e) => {
-            error!("无法打开风扇控制文件 {}: {}", pwm_path, e);
+        } else {
+            error!("Failed to write fan speed to {}", pwm_path);
             false
         }
+    } else {
+        error!("Cannot open fan path {}", pwm_path);
+        false
     }
 }
 
-/// 硬编码温度到PWM（避免任何CPU运算、无线性插值）
-/// 25°C及以下77；26~59查表；60及以上255
 fn calculate_fan_speed(temp: u32) -> u8 {
-    // 25°C及以下
     if temp <= 25 {
         77
     } else if temp >= 60 {
         255
     } else {
-        // 26~59°C
-        // Python线性公式: ((temp-25)*(255-77)//(60-25))+77
-        // 预先查表
         const LUT: [u8; 34] = [
-            82, 87, 92, 97, 102, 107, 112, 117, 122, 127, 132, 137,
-            142, 147, 152, 157, 162, 167, 172, 177, 182, 187, 192,
-            197, 202, 207, 212, 217, 222, 227, 232, 237, 242, 247
+            82,87,92,97,102,107,112,117,122,127,132,137,
+            142,147,152,157,162,167,172,177,182,187,192,
+            197,202,207,212,217,222,227,232,237,242,247
         ];
-        LUT[(temp-26) as usize]
+        LUT[(temp - 26) as usize]
     }
 }
 
-/// 获取GPU温度
-fn get_gpu_temp(nvml: &NVML) -> Option<u32> {
-    let device = nvml.device_by_index(0).ok()?;
-    match device.temperature(nvml::device::TemperatureSensor::Gpu) {
-        Ok(t) => Some(t as u32),
-        Err(e) => {
-            error!("无法读取GPU温度: {:?}", e);
-            None
-        }
-    }
+fn get_gpu_temp(nvml: &Nvml) -> Option<u32> {
+    let d = nvml.device_by_index(0).ok()?;
+    d.temperature(TemperatureSensor::Gpu).ok().map(|t| t as u32)
 }
 
-/// 打印所有GPU的详细信息
-fn print_gpu_info(nvml: &NVML) {
+fn print_gpu_info(nvml: &Nvml) {
     match nvml.device_count() {
-        Ok(count) => info!("系统中发现 {} 个GPU设备", count),
-        Err(e) => { error!("获取GPU数量失败: {:?}", e); return; }
+        Ok(c) => info!("Found {} GPU(s)", c),
+        Err(e) => { error!("Failed to get device count: {:?}", e); return; }
     }
-    let count = nvml.device_count().unwrap();
-    for i in 0..count {
-        let device = match nvml.device_by_index(i) {
-            Ok(d) => d,
-            Err(e) => { error!("获取GPU {}失败: {:?}", i, e); continue; }
+    for i in 0..nvml.device_count().unwrap() {
+        let d = match nvml.device_by_index(i) {
+            Ok(x) => x,
+            Err(e) => { error!("Cannot get GPU {}: {:?}", i, e); continue; }
         };
-        let name = device.name().unwrap_or_else(|_| "Unknown".into());
-        let temp = device.temperature(nvml::device::TemperatureSensor::Gpu)
-            .unwrap_or(0);
-        let mem = device.memory_info().ok();
-        let power = device.power_usage().ok().map(|p| (p as f32)/1000.0);
-        let fan = device.fan_speed().ok();
+        let name = d.name().unwrap_or_else(|_| "Unknown".into());
+        let temp = d.temperature(TemperatureSensor::Gpu).unwrap_or(0);
+        let mem = d.memory_info().ok();
+        let pw = d.power_usage().ok().map(|p| p as f32 / 1000.0);
+        let fan = d.fan_speed(0).ok();
 
         info!("\nGPU {}: {}", i, name);
-        info!("温度: {}°C", temp);
+        info!("Temp: {}°C", temp);
         if let Some(m) = mem {
-            info!("显存: 已用 {}MB / 总共 {}MB (剩余 {}MB)",
-                m.used/1024/1024, m.total/1024/1024, m.free/1024/1024);
+            info!("Mem: Used {}MB / Total {}MB",
+                m.used / 1024 / 1024, m.total / 1024 / 1024);
         }
-        if let Some(p) = power {
-            info!("功耗: {:.1}W", p);
-        }
-        if let Some(f) = fan {
-            info!("风扇转速: {}%", f);
-        }
+        if let Some(p) = pw { info!("Power: {:.1} W", p); }
+        if let Some(f) = fan { info!("Fan speed: {}%", f); }
     }
 }
 
@@ -170,82 +137,62 @@ fn main() {
     init_log();
     let args = Args::parse();
 
-    let nvml = match NVML::init() {
-        Ok(n) => n,
-        Err(e) => {
-            error!("初始化NVML失败: {:?}", e);
-            exit(1);
-        }
-    };
+    let nvml = Nvml::init().unwrap_or_else(|e| {
+        error!("Failed to init NVML: {:?}", e);
+        exit(1)
+    });
 
     if args.info {
         print_gpu_info(&nvml);
-        nvml.shutdown().ok();
         return;
     }
 
-    let pwm_path = match args.pwm_path {
-        Some(ref p) => p,
-        None => {
-            error!("需要提供PWM控制文件路径，除非使用--info选项");
-            exit(1);
-        }
-    };
+    let pwm = args.pwm_path.as_ref().unwrap_or_else(|| {
+        error!("Must provide PWM path unless --info");
+        exit(1);
+    });
 
-    if !Path::new(pwm_path).exists() {
-        error!("PWM控制文件不存在: {}", pwm_path);
+    if !Path::new(pwm).exists() {
+        error!("PWM path does not exist: {}", pwm);
         exit(1);
     }
 
-    let interval = if args.interval < 0.1 {
-        warn!("检查间隔过短，已设为0.1s");
-        0.1
-    } else {
-        args.interval
-    };
+    let interval = if args.interval < 0.1 { warn!("Interval too low, use 0.1s"); 0.1 } else { args.interval };
 
-    // 设置为手动模式
-    if !set_pwm_mode(pwm_path, 1) {
-        error!("无法设置PWM为手动模式，程序退出");
+    if !set_pwm_mode(pwm, 1) {
+        error!("Failed to enable manual PWM mode");
         exit(1);
     }
 
-    // 退出时清理
     let running = Arc::new(AtomicBool::new(true));
     {
-        let running = running.clone();
-        let pwm_path = pwm_path.clone();
+        let r = running.clone();
+        let p = pwm.clone();
         ctrlc::set_handler(move || {
-            running.store(false, Ordering::SeqCst);
-            set_fan_speed(&pwm_path, 77);
-            set_pwm_mode(&pwm_path, 2);
-        }).expect("无法设置 Ctrl-C 处理");
+            r.store(false, Ordering::SeqCst);
+            set_fan_speed(&p, 77);
+            set_pwm_mode(&p, 2);
+        }).expect("Cannot set Ctrl-C handler");
     }
 
-    // 主循环
-    info!("正在监控GPU温度，使用PWM路径: {}", pwm_path);
-    let mut last_temp = 0;
-    let mut last_speed = 0;
+    let (mut lt, mut ls) = (0, 0);
+    info!("Monitoring GPU temp, PWM path: {}", pwm);
     while running.load(Ordering::SeqCst) {
-        let temp = get_gpu_temp(&nvml).unwrap_or(0);
-        let speed = if temp > 0 { calculate_fan_speed(temp) } else { 77 };
-        // 仅当温度或转速变化时才写入
-        if temp != last_temp || speed != last_speed {
-            set_fan_speed(pwm_path, speed);
-            if temp > 0 {
-                info!("温度: {}°C, 风扇转速: {}/255 ({}%)", temp, speed, speed as u32 * 100 / 255);
+        let t = get_gpu_temp(&nvml).unwrap_or(0);
+        let sp = if t>0 { calculate_fan_speed(t) } else { 77 };
+        if t!=lt || sp!=ls {
+            set_fan_speed(pwm, sp);
+            if t>0 {
+                info!("Temp {}°C, speed {}/255 ({}%)", t, sp, sp as u32 * 100/255);
             } else {
-                warn!("无法获取GPU温度，使用默认转速");
+                warn!("GPU temp unavailable, use default speed");
             }
-            last_temp = temp;
-            last_speed = speed;
+            (lt, ls) = (t, sp);
         }
         thread::sleep(time::Duration::from_secs_f64(interval));
     }
 
-    // 程序退出清理
-    set_fan_speed(pwm_path, 77);
-    set_pwm_mode(pwm_path, 2);
-    nvml.shutdown().ok();
-    info!("程序已停止");
+    set_fan_speed(pwm, 77);
+    set_pwm_mode(pwm, 2);
+    info!("Exited cleanly");
 }
