@@ -4,9 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
-log = "0.4"
-env_logger = "0.10"
-chrono = "0.4"
-nvml-wrapper = "0.11"             # 安全、轻量的 NVML Rust 包:contentReference[oaicite:0]{index=0}
-ctrlc = "3"
+clap = { version = "4.0", features = ["derive"] }
+nvml-wrapper = "0.10"
+ctrlc = "3.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = false
+
+[profile.release.package."*"]
+opt-level = 3

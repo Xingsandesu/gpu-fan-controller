@@ -1,198 +1,282 @@
 use clap::Parser;
-use log::{info, warn, error};
-use nvml_wrapper::Nvml;
-use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
-use std::fs::{OpenOptions, read_to_string};
-use std::io::Write;
-use std::path::Path;
-use std::process::exit;
-use std::{thread, time};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use chrono;
-use ctrlc;
+use nvml_wrapper::{Nvml, enum_wrappers::device::TemperatureSensor};
+use std::{
+    fs::{File, OpenOptions},
+    io::{Read, Write, Seek, SeekFrom},
+    path::Path,
+    process::exit,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread::sleep,
+    time::Duration,
+};
 
 #[derive(Parser, Debug)]
-#[command(author, version, about)]
 struct Args {
-    /// 风扇 PWM 控制文件路径
     pwm_path: Option<String>,
-
-    /// 检查间隔(秒)
     #[arg(long, default_value_t = 2.0)]
     interval: f64,
-
-    /// 显示GPU详细信息后退出
     #[arg(long)]
     info: bool,
 }
 
-fn init_log() {
-    env_logger::Builder::from_default_env()
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "[{}] {:<8} {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                record.level(),
-                record.args()
-            )
-        })
-        .init();
+struct FileBuffer {
+    path_buf: String,
+    content_buf: String,
 }
 
-fn find_enable_path(pwm_path: &str) -> String {
-    format!("{}_enable", pwm_path)
-}
-
-fn read_enable_mode(enable_path: &str) -> Option<u8> {
-    read_to_string(enable_path).ok()?.trim().parse().ok()
-}
-
-fn set_pwm_mode(pwm_path: &str, mode: u8) -> bool {
-    let enable = find_enable_path(pwm_path);
-    if !Path::new(&enable).exists() {
-        error!("PWM enable file not found: {}", enable);
-        return false;
-    }
-    if let Some(current) = read_enable_mode(&enable) {
-        if current != mode {
-            if let Ok(mut f) = OpenOptions::new().write(true).open(&enable) {
-                if f.write_all(mode.to_string().as_bytes()).is_err() {
-                    error!("Failed to write PWM mode");
-                    return false;
-                }
-                info!("PWM mode set to {}", if mode==1 { "manual" } else { "auto" });
-            }
+impl FileBuffer {
+    fn new() -> Self {
+        Self {
+            path_buf: String::with_capacity(64),
+            content_buf: String::with_capacity(16),
         }
-        true
-    } else {
-        error!("Failed to read PWM mode from {}", enable);
-        false
+    }
+
+    fn make_enable_path(&mut self, pwm_path: &str) {
+        self.path_buf.clear();
+        self.path_buf.push_str(pwm_path);
+        self.path_buf.push_str("_enable");
     }
 }
 
-fn set_fan_speed(pwm_path: &str, speed: u8) -> bool {
-    if let Ok(mut f) = OpenOptions::new().write(true).open(pwm_path) {
-        if f.write_all(speed.to_string().as_bytes()).is_ok() {
-            true
+struct CachedFiles {
+    pwm_file: Option<File>,
+    enable_file: Option<File>,
+}
+
+impl CachedFiles {
+    fn new() -> Self {
+        Self {
+            pwm_file: None,
+            enable_file: None,
+        }
+    }
+
+    fn get_or_open_pwm(&mut self, path: &str) -> Option<&mut File> {
+        if self.pwm_file.is_none() {
+            self.pwm_file = OpenOptions::new().write(true).open(path).ok();
+        }
+        self.pwm_file.as_mut()
+    }
+
+    fn get_or_open_enable(&mut self, path: &str) -> Option<&mut File> {
+        if self.enable_file.is_none() {
+            self.enable_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .ok();
+        }
+        self.enable_file.as_mut()
+    }
+}
+
+struct FanController {
+    nvml: Nvml,
+    pwm_path: String,
+    enable_path: String,
+    last_temp: u32,
+    last_speed: u8,
+    buffer: FileBuffer,
+    files: CachedFiles,
+}
+
+impl FanController {
+    fn new(nvml: Nvml, pwm_path: String) -> Option<Self> {
+        let mut buffer = FileBuffer::new();
+        buffer.make_enable_path(&pwm_path);
+        
+        if !Path::new(&buffer.path_buf).exists() {
+            return None;
+        }
+
+        let enable_path = buffer.path_buf.clone();
+        let mut controller = Self {
+            nvml,
+            pwm_path,
+            enable_path,
+            last_temp: 0,
+            last_speed: 0,
+            buffer,
+            files: CachedFiles::new(),
+        };
+
+        if !controller.set_pwm_mode(1) {
+            return None;
+        }
+
+        Some(controller)
+    }
+
+    #[inline(always)]
+    fn calculate_fan_speed(temp: u32) -> u8 {
+        match temp {
+            0..=25 => 77,
+            26..=59 => 77 + ((temp - 25) * 5).min(178) as u8,
+            _ => 255,
+        }
+    }
+
+    #[inline(always)]
+    fn get_gpu_temp(&self) -> Option<u32> {
+        self.nvml
+            .device_by_index(0)
+            .ok()?
+            .temperature(TemperatureSensor::Gpu)
+            .ok()
+            .map(|t| t as u32)
+    }
+
+    fn read_u8_from_enable_file(&mut self) -> Option<u8> {
+        let enable_path = self.enable_path.clone();
+        let file = self.files.get_or_open_enable(&enable_path)?;
+        self.buffer.content_buf.clear();
+        file.seek(SeekFrom::Start(0)).ok()?;
+        file.read_to_string(&mut self.buffer.content_buf).ok()?;
+        self.buffer.content_buf.trim().parse().ok()
+    }
+
+    fn write_u8_to_pwm_file(&mut self, val: u8) -> bool {
+        let pwm_path = self.pwm_path.clone();
+        if let Some(file) = self.files.get_or_open_pwm(&pwm_path) {
+            file.seek(SeekFrom::Start(0)).is_ok()
+                && file.write_all(val.to_string().as_bytes()).is_ok()
+                && file.flush().is_ok()
         } else {
-            error!("Failed to write fan speed to {}", pwm_path);
             false
         }
-    } else {
-        error!("Cannot open fan path {}", pwm_path);
+    }
+
+    fn write_u8_to_enable_file(&mut self, val: u8) -> bool {
+        let enable_path = self.enable_path.clone();
+        if let Some(file) = self.files.get_or_open_enable(&enable_path) {
+            file.seek(SeekFrom::Start(0)).is_ok()
+                && file.write_all(val.to_string().as_bytes()).is_ok()
+                && file.flush().is_ok()
+        } else {
+            false
+        }
+    }
+
+    fn set_pwm_mode(&mut self, mode: u8) -> bool {
+        if let Some(current) = self.read_u8_from_enable_file() {
+            if current != mode {
+                return self.write_u8_to_enable_file(mode);
+            }
+            return true;
+        }
         false
     }
-}
 
-fn calculate_fan_speed(temp: u32) -> u8 {
-    if temp <= 25 {
-        77
-    } else if temp >= 60 {
-        255
-    } else {
-        const LUT: [u8; 34] = [
-            82,87,92,97,102,107,112,117,122,127,132,137,
-            142,147,152,157,162,167,172,177,182,187,192,
-            197,202,207,212,217,222,227,232,237,242,247
-        ];
-        LUT[(temp - 26) as usize]
+    fn set_fan_speed(&mut self, speed: u8) -> bool {
+        self.write_u8_to_pwm_file(speed)
     }
-}
 
-fn get_gpu_temp(nvml: &Nvml) -> Option<u32> {
-    let d = nvml.device_by_index(0).ok()?;
-    d.temperature(TemperatureSensor::Gpu).ok().map(|t| t as u32)
-}
-
-fn print_gpu_info(nvml: &Nvml) {
-    match nvml.device_count() {
-        Ok(c) => info!("Found {} GPU(s)", c),
-        Err(e) => { error!("Failed to get device count: {:?}", e); return; }
-    }
-    for i in 0..nvml.device_count().unwrap() {
-        let d = match nvml.device_by_index(i) {
-            Ok(x) => x,
-            Err(e) => { error!("Cannot get GPU {}: {:?}", i, e); continue; }
-        };
-        let name = d.name().unwrap_or_else(|_| "Unknown".into());
-        let temp = d.temperature(TemperatureSensor::Gpu).unwrap_or(0);
-        let mem = d.memory_info().ok();
-        let pw = d.power_usage().ok().map(|p| p as f32 / 1000.0);
-        let fan = d.fan_speed(0).ok();
-
-        info!("\nGPU {}: {}", i, name);
-        info!("Temp: {}°C", temp);
-        if let Some(m) = mem {
-            info!("Mem: Used {}MB / Total {}MB",
-                m.used / 1024 / 1024, m.total / 1024 / 1024);
+    fn update(&mut self) {
+        if let Some(temp) = self.get_gpu_temp() {
+            let speed = Self::calculate_fan_speed(temp);
+            if temp != self.last_temp || speed != self.last_speed {
+                if self.set_fan_speed(speed) {
+                    println!("温度: {}°C，风扇速度: {} / 255", temp, speed);
+                    self.last_temp = temp;
+                    self.last_speed = speed;
+                }
+            }
+        } else if self.last_speed != 77 {
+            if self.set_fan_speed(77) {
+                println!("无法读取温度，使用默认速度 77");
+                self.last_speed = 77;
+            }
         }
-        if let Some(p) = pw { info!("Power: {:.1} W", p); }
-        if let Some(f) = fan { info!("Fan speed: {}%", f); }
     }
+
+    fn cleanup(&mut self) {
+        println!("正在执行清理...");
+        let _ = self.set_fan_speed(77);
+        let _ = self.set_pwm_mode(2);
+    }
+}
+
+// **关键修复**：为 FanController 实现 Drop 特性
+impl Drop for FanController {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+static RUNNING: AtomicBool = AtomicBool::new(true);
+
+fn setup_signal_handler() {
+    ctrlc::set_handler(|| {
+        println!("\n接收到退出信号，正在准备关闭...");
+        RUNNING.store(false, Ordering::Relaxed);
+    })
+    .unwrap_or_else(|_| {
+        eprintln!("无法设置信号处理器");
+    });
 }
 
 fn main() {
-    init_log();
     let args = Args::parse();
 
     let nvml = Nvml::init().unwrap_or_else(|e| {
-        error!("Failed to init NVML: {:?}", e);
-        exit(1)
+        eprintln!("无法初始化 NVML: {}", e);
+        exit(1);
     });
 
     if args.info {
-        print_gpu_info(&nvml);
+        if let Ok(count) = nvml.device_count() {
+            for i in 0..count {
+                if let Ok(device) = nvml.device_by_index(i) {
+                    match device.temperature(TemperatureSensor::Gpu) {
+                        Ok(temp) => println!("GPU {} 温度: {}°C", i, temp),
+                        Err(e) => println!("GPU {} 温度读取失败: {}", i, e),
+                    }
+                }
+            }
+        }
         return;
     }
 
-    let pwm = args.pwm_path.as_ref().unwrap_or_else(|| {
-        error!("Must provide PWM path unless --info");
+    let pwm_path = match args.pwm_path {
+        Some(ref p) if Path::new(p).exists() => p.clone(),
+        Some(ref p) => {
+            eprintln!("PWM 路径不存在: {}", p);
+            exit(1);
+        }
+        None => {
+            eprintln!("必须指定 PWM 路径");
+            exit(1);
+        }
+    };
+
+    let controller = FanController::new(nvml, pwm_path).unwrap_or_else(|| {
+        eprintln!("无法初始化风扇控制器");
         exit(1);
     });
 
-    if !Path::new(pwm).exists() {
-        error!("PWM path does not exist: {}", pwm);
-        exit(1);
-    }
+    let controller_arc = Arc::new(Mutex::new(controller));
+    setup_signal_handler();
 
-    let interval = if args.interval < 0.1 { warn!("Interval too low, use 0.1s"); 0.1 } else { args.interval };
+    let sleep_nanos = (args.interval * 1_000_000_000.0) as u64;
+    let sleep_duration = Duration::from_nanos(sleep_nanos);
 
-    if !set_pwm_mode(pwm, 1) {
-        error!("Failed to enable manual PWM mode");
-        exit(1);
-    }
+    println!("风扇控制器已启动，监控间隔: {:.2}秒。按 Ctrl+C 退出。", args.interval);
 
-    let running = Arc::new(AtomicBool::new(true));
-    {
-        let r = running.clone();
-        let p = pwm.clone();
-        ctrlc::set_handler(move || {
-            r.store(false, Ordering::SeqCst);
-            set_fan_speed(&p, 77);
-            set_pwm_mode(&p, 2);
-        }).expect("Cannot set Ctrl-C handler");
-    }
-
-    let (mut lt, mut ls) = (0, 0);
-    info!("Monitoring GPU temp, PWM path: {}", pwm);
-    while running.load(Ordering::SeqCst) {
-        let t = get_gpu_temp(&nvml).unwrap_or(0);
-        let sp = if t>0 { calculate_fan_speed(t) } else { 77 };
-        if t!=lt || sp!=ls {
-            set_fan_speed(pwm, sp);
-            if t>0 {
-                info!("Temp {}°C, speed {}/255 ({}%)", t, sp, sp as u32 * 100/255);
-            } else {
-                warn!("GPU temp unavailable, use default speed");
+    while RUNNING.load(Ordering::Relaxed) {
+        {
+            if let Ok(mut ctrl) = controller_arc.lock() {
+                ctrl.update();
             }
-            (lt, ls) = (t, sp);
         }
-        thread::sleep(time::Duration::from_secs_f64(interval));
+        sleep(sleep_duration);
     }
 
-    set_fan_speed(pwm, 77);
-    set_pwm_mode(pwm, 2);
-    info!("Exited cleanly");
+    println!("程序即将退出。");
+    // **关键修复**：不再需要手动调用 cleanup。
+    // 当 main 函数结束时，controller_arc 会被销毁，
+    // 其内部的 FanController 的 drop 方法会自动被调用。
 }
